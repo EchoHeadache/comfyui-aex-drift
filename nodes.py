@@ -13,6 +13,7 @@ import os
 
 import torch
 
+import comfy.model_management
 import folder_paths
 from comfy.latent_formats import MiniMaxH3Video
 from comfy.nested_tensor import NestedTensor
@@ -153,6 +154,144 @@ def seam_anchor(latent, strength, region, detail, still_tolerance, min_still):
     logging.info("AEX Drift: seam anchor graded %d new latent steps over %d%% still picture (channel gains %.2f to %.2f over the "
                  "whole picture, detail gains %.2f to %.2f).", len(new), share * 100, whole.min(), whole.max(), sharp.min(), sharp.max())
     return dict(latent, samples=NestedTensor((video, audio)), aex_drift_anchor=report)
+
+
+def gauss(x, s):
+    """Separable Gaussian blur of (N, C, H, W), reflected at the edges and cut at 4 sigma."""
+    r = int(4 * s + 0.5)
+    k = torch.exp(-torch.arange(-r, r + 1, device=x.device, dtype=x.dtype) ** 2 / (2 * s * s))
+    k = (k / k.sum()).view(1, 1, 1, -1).expand(x.shape[1], 1, 1, -1)
+    x = torch.nn.functional.conv2d(torch.nn.functional.pad(x, (r, r, 0, 0), mode="reflect"), k, groups=x.shape[1])
+    return torch.nn.functional.conv2d(torch.nn.functional.pad(x, (0, 0, r, r), mode="reflect"), k.transpose(-1, -2), groups=x.shape[1])
+
+
+MATERIALS = 8  # colour clusters the texture hold measures separately, before merging near-duplicates
+
+
+def texture_hold(latent, vae, strength, window, floor):
+    """Soften an extend's new frames back to the texture of its held frames, region by region, moving subjects included.
+
+    Each extend comes out a little rougher than the frames it holds: blotchier skin, harder folds, more pronounced lines, mostly
+    at 3 to 20 px. Seam Anchor holds it where the picture is still, but faces and clothes move, and the next extend continues from
+    the rougher latent. Resampling the last steps, with the base model or a turbo LoRA, didn't soften it in tests. So the frames
+    are decoded and split into bands, and the pixels into a few materials by their colour below 8 px. The energy of the 3-8 px and
+    8-20 px bands is measured per material over windows of the frame, on the held frames and on each new frame; where a material
+    came out rougher in a window, those two bands are scaled down to its held level there (or to its level over the whole held
+    picture, if it wasn't in that window then), never below it and never by more than `floor`. The 1-3 px band (pores, grain) is
+    left as sampled, so skin doesn't go waxy. Measuring per material keeps a rougher face from softening the hoodie or the wall
+    in the same window. The change is carried into the new rows by encoding each corrected 17-frame clip and its uncorrected
+    original and adding the difference, which leaves out the VAE round trip's own error."""
+    mask = latent.get("noise_mask")
+    if mask is None:
+        return latent
+    held = (mask.unbind()[0][0, 0].amin(dim=(1, 2)) < 1).tolist()  # the rows Apply Pins wrote
+    h = held.index(False) if False in held else len(held)
+    new = [t for t in range(h, len(held)) if not held[t]]
+    if h < 5 or not new:
+        return latent
+    video, audio = latent["samples"].unbind()
+    frames = vae.decode(video)
+    frames = frames.reshape((-1,) + frames.shape[-3:])
+    start = lambda r: r // 5 * 17 + (r % 5 and 1 + 4 * (r % 5 - 1))  # first frame of a latent row: 1, 4, 4, 4, 4 frames per group of 5
+    ref = range(1, start(h - 2))  # held frames clear of the decoder's two steps of lookahead into the new rows
+    first = start(new[0])
+    dev = comfy.model_management.get_torch_device()
+    luma = torch.tensor([0.2126, 0.7152, 0.0722], device=dev).view(1, 3, 1, 1)
+    k = max(16, int(window * frames.shape[2]))
+    load = lambda f: frames[f].to(dev).movedim(-1, 0)[None].float()
+    pool = lambda x: torch.nn.functional.avg_pool2d(x, k, stride=k // 2, ceil_mode=True)
+
+    def colour(x):  # Y and doubled Cb, Cr of the picture below 8 px, at 1/8 size
+        small = torch.nn.functional.avg_pool2d(gauss(x, 8.0), 8)
+        y = (luma * small).sum(1)
+        return torch.stack([y, (small[:, 2] - y) / 1.8556 * 2, (small[:, 0] - y) / 1.5748 * 2], dim=1)
+
+    sample = torch.cat([colour(load(f))[0].flatten(1).T for f in ref[::4]])
+    sample = sample[torch.randperm(len(sample), generator=torch.Generator().manual_seed(0))[:20000].to(dev)]
+    centers = sample[:1]
+    for _ in range(MATERIALS - 1):  # farthest-point seeds, then k-means
+        centers = torch.cat([centers, sample[torch.cdist(sample, centers).amin(1).argmax()][None]])
+    for _ in range(25):
+        nearest = torch.cdist(sample, centers).argmin(1)
+        centers = torch.stack([sample[nearest == i].mean(0) if (nearest == i).any() else centers[i] for i in range(MATERIALS)])
+    # a scene with fewer colours than that gets fewer materials: near-duplicate ones would split each window between them
+    count = torch.bincount(torch.cdist(sample, centers).argmin(1), minlength=MATERIALS)
+    kept = []
+    for i in count.argsort(descending=True).tolist():
+        if count[i] > len(sample) // 100 and all((centers[i] - centers[j]).norm() > 0.04 for j in kept):
+            kept.append(i)
+    centers, materials = centers[kept], len(kept)
+    spread = torch.cdist(sample, centers).amin(1).median().clamp_min(0.01)
+
+    def measure(x):
+        """Soft material weights (M, H, W), and per window and material the band energy (M, 2, gh, gw) and the share of the window
+        it was measured over (M, gh, gw). Each material is measured on its interior, the pixels it clearly owns at least 4 px from
+        any other: the edges between materials (glasses, hairline, the rim of a sleeve) hold most of the band energy, and a face
+        that got blotchier inside hardly moves the energy of a window that includes them."""
+        d = ((colour(x)[:, None] - centers[None, :, :, None, None]) ** 2).sum(2)
+        w = torch.nn.functional.interpolate(torch.softmax(-d / (2 * spread ** 2), dim=1), size=x.shape[-2:], mode="bilinear", align_corners=False)[0]
+        own = -torch.nn.functional.max_pool2d(-(w > 0.6).to(w)[None], 9, stride=1, padding=4)[0]
+        g1, g3, g8 = gauss(x, 1.0), gauss(x, 3.0), gauss(x, 8.0)
+        b = (g1 - g3, g3 - g8)
+        share = pool(own[None])[0]
+        energy = torch.stack([pool(own[None] * (luma * v).sum(1, keepdim=True) ** 2)[0] for v in b], 1)
+        return w, b, energy, share
+
+    total, present = 0, 0
+    for f in ref:
+        _, _, e, n = measure(load(f))
+        total, present = total + e, present + n
+    there = (present / len(ref) > 0.1)[:, None]
+    whole = total.sum((2, 3)) / present.sum((1, 2))[:, None].clamp_min(1e-6)  # each material's energy over the whole held picture
+    known = (present.sum((1, 2)) > 0)[:, None, None, None]  # a material the held frames don't show has nothing to be held to
+    target = torch.where(there, total / present[:, None].clamp_min(1e-6), whole[..., None, None]).sqrt()
+    measured, gain = [], []
+    for f in range(first, frames.shape[0]):
+        _, _, e, n = measure(load(f))
+        m = (e / n[:, None].clamp_min(1e-6)).sqrt()
+        # a material that barely touches this window keeps its texture
+        cut = torch.where((n > 0.1)[:, None] & known, 1 - (target / m.clamp_min(1e-6)).clamp(floor, 1.0), 0.0)
+        # a subject that turns or moves carries its texture from window to window; a material is softened only as far as its
+        # energy over the whole picture rose, to within 3% of the held level, so a cat that turned its head keeps its fur
+        a, b = (e * cut ** 2).sum((2, 3)), (e * cut).sum((2, 3))
+        c = e.sum((2, 3)) - whole * n.sum((1, 2))[:, None] * 0.97 ** 2
+        keep = ((b - (b ** 2 - a * c).clamp_min(0).sqrt()) / a.clamp_min(1e-12)).clamp(0.0, 1.0)  # the share of the cut that lands there
+        keep = torch.where(c <= 0, 0.0, torch.where(a - 2 * b + c >= 0, 1.0, keep))
+        gain.append(1 - keep[..., None, None] * cut)
+        measured.append(m)
+    measured, gain = torch.stack(measured), torch.stack(gain)
+    # smoothed over about a third of a second, so the softening doesn't flicker
+    kt = torch.exp(-torch.arange(-12, 13, device=dev, dtype=gain.dtype) ** 2 / 32)
+    g = torch.nn.functional.conv1d(torch.nn.functional.pad(gain.flatten(1).T[:, None], (12, 12), mode="replicate"), (kt / kt.sum()).view(1, 1, -1))
+    gain = 1 + strength * (g[:, 0].T.view(gain.shape) - 1)
+
+    def soften(f):
+        x = load(f)
+        out, g = x, gain[f - first]
+        aim = measured[f - first] * g
+        for i in range(3):
+            w, b, e, n = measure(out)
+            if i:  # the bilinear map and the blur share each window's gain with its neighbours, so measure again and take the rest
+                g = torch.where((n > 0.1)[:, None], (aim / (e / n[:, None].clamp_min(1e-6)).sqrt().clamp_min(1e-6)).clamp(max=1.0), 1.0)
+            gmap = torch.nn.functional.interpolate(g.flatten(0, 1)[None], size=x.shape[-2:], mode="bilinear", align_corners=False)[0]
+            gmap = (w[:, None] * gmap.view(materials, 2, *x.shape[-2:])).sum(0)
+            # blurred, so the change reaches nothing finer than the mid band and the fine band stays as sampled
+            out = out + gauss((gmap[0] - 1) * b[0] + (gmap[1] - 1) * b[1], 2.5)
+        return out[0].movedim(0, -1).clamp(0.0, 1.0)
+
+    video = video.clone()
+    for c in range(new[0] // 5, (len(held) + 4) // 5):
+        # the VAE encodes each 17-frame clip on its own and drops the last 3 latent steps of every call, so one frame of the next
+        # clip goes along to keep this clip's 5 steps
+        clip = frames[c * 17:c * 17 + 18]
+        fixed = torch.stack([soften(f).to(clip) if first <= f < c * 17 + 17 else clip[f - c * 17] for f in range(c * 17, c * 17 + len(clip))])
+        rows = [t for t in range(c * 5, c * 5 + 5) if t in new]
+        diff = (vae.encode(fixed) - vae.encode(clip)).to(video)
+        video[:, :, rows] += diff[:, :, [t - c * 5 for t in rows]]
+    logging.info("AEX Drift: texture hold softened %d new frames toward %d held ones over %d materials (3-8 px band gains %.2f to 1, "
+                 "8-20 px %.2f to 1, on average %.3f and %.3f).", frames.shape[0] - first, len(ref), materials,
+                 gain[:, :, 0].min(), gain[:, :, 1].min(), gain[:, :, 0].mean(), gain[:, :, 1].mean())
+    return dict(latent, samples=NestedTensor((video, audio)))
 
 
 # what counts as a real residual, from the tests behind the README: with Seam Anchor a take stayed within half a code of luma, a point
@@ -393,6 +532,36 @@ class AEXDriftSeamAnchor(io.ComfyNode):
         return io.NodeOutput(seam_anchor(latent, strength, region, detail, still_tolerance, min_still))
 
 
+class AEXDriftTextureHold(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="AEXDriftTextureHold",
+            display_name="AEX Drift Texture Hold",
+            category="aex-drift",
+            description="Softens an extend's new frames back to the texture of its held frames, moving subjects included: window by window, "
+                        "the 3-8 px and 8-20 px bands of each new frame are scaled down to the held frames' level where the take came out "
+                        "rougher, never below it; the 1-3 px band is left as sampled. The change goes back into the latent, so the next "
+                        "extend continues from it. Takes with nothing held pass through.",
+            inputs=[
+                io.Latent.Input("latent", tooltip="Seam Anchor's output, with Apply Pins' noise mask."),
+                io.Vae.Input("vae", tooltip="H3 video VAE."),
+                io.Float.Input("strength", default=1.0, min=0.0, max=1.0, step=0.05,
+                               tooltip="How much of the measured softening to apply. 0 passes the take through."),
+                io.Float.Input("window", default=0.08, min=0.02, max=0.5, step=0.01,
+                               tooltip="Width of the windows the texture is measured over, as a share of the frame width (0.08 is 128 px at "
+                                       "1600 wide). Smaller follows a face or a sleeve more closely but compares fewer pixels."),
+                io.Float.Input("floor", default=0.6, min=0.3, max=1.0, step=0.05,
+                               tooltip="The most a band may be scaled down in one take: 0.6 keeps at least 60% of its sampled energy."),
+            ],
+            outputs=[io.Latent.Output(display_name="latent")],
+        )
+
+    @classmethod
+    def execute(cls, latent, vae, strength, window, floor) -> io.NodeOutput:
+        return io.NodeOutput(texture_hold(latent, vae, strength, window, floor))
+
+
 class AEXDriftCheck(io.ComfyNode):
     @classmethod
     def define_schema(cls):
@@ -432,4 +601,4 @@ class AEXDriftCheck(io.ComfyNode):
 
 class DriftExtension(ComfyExtension):
     async def get_node_list(self):
-        return [AEXDriftFirstStagePins, AEXDriftHandoffMatch, AEXDriftSeamAnchor, AEXDriftCheck]
+        return [AEXDriftFirstStagePins, AEXDriftHandoffMatch, AEXDriftSeamAnchor, AEXDriftTextureHold, AEXDriftCheck]

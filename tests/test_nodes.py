@@ -177,6 +177,87 @@ class DriftTest(unittest.TestCase):
         self.assertTrue(0.4 < graded["aex_drift_anchor"]["share"] < 0.6 and torch.equal(video[..., :2], before[..., :2]))
         self.assertLess((video[..., 20:] - truth[..., 20:]).abs().mean(), (before[..., 20:] - truth[..., 20:]).abs().mean() / 3)
 
+    def test_the_texture_hold_softens_the_new_frames_to_the_held_texture(self):
+        take = fake_latent(192, 0)
+        held = torch.ones(1, 1, 57, 4, 6)
+        held[:, :, :12] = 0.0  # 39 frames held
+        take["noise_mask"] = NestedTensor((held, torch.ones(1, 1, 2, 320)))
+        torch.manual_seed(0)
+        texture = drift.gauss(torch.randn(192, 1, 64, 96), 3.0)
+        texture = (texture / texture.std()).expand(-1, 3, -1, -1)
+        grain = torch.randn(192, 1, 64, 96).expand(-1, 3, -1, -1) * 0.01
+
+        # two materials, skin-coloured on the left and gray on the right, each with its own texture
+        colours = torch.tensor([[0.75, 0.55, 0.45], [0.4, 0.42, 0.45]]).repeat_interleave(48, 0).T.view(1, 3, 1, 96)
+
+        class FrameVAE:
+            def __init__(self, roughness, moved=False):
+                rough = 0.03 * texture * torch.where(torch.arange(192) >= 39, roughness, 1.0).view(-1, 1, 1, 1)
+                if moved:  # the new frames' texture gathers in the top half of the picture, as a subject that moves carries it
+                    rough[39:] = rough[39:] * torch.cat([torch.full((32,), 1.3), torch.full((32,), 0.6)]).view(1, 1, -1, 1)
+                self.frames = (colours + rough + grain).movedim(1, -1)
+                self.encoded = []
+
+            def decode(self, latent):
+                return self.frames[None]
+
+            def encode(self, pixels):
+                self.encoded.append(pixels)
+                steps = (len(pixels) + 16) // 17 * 5 - 3
+                return pixels.mean().expand(1, 24, steps, 4, 6)
+
+        mid = lambda x: drift.gauss(x, 1.0) - drift.gauss(x, 3.0)
+        coarse = lambda x: drift.gauss(x, 3.0) - drift.gauss(x, 8.0)
+        fine = lambda x: x - drift.gauss(x, 1.0)
+        away = (torch.arange(96) - 47.5).abs() > 12  # clear of the edge between the two materials
+        energy = lambda band, frames: band(frames.movedim(-1, 1))[..., away].std().item()
+        vae = FrameVAE(1.3)
+        hold = lambda latent, vae, **kw: drift.AEXDriftTextureHold.execute(latent=latent, vae=vae, **dict(dict(strength=1.0, window=0.25, floor=0.6), **kw)).args[0]
+        out = hold(take, vae)
+        video, audio = out["samples"].unbind()
+        before_video, before_audio = take["samples"].unbind()
+        self.assertTrue(torch.equal(video[:, :, :12], before_video[:, :, :12]) and audio is before_audio and out["noise_mask"] is take["noise_mask"])
+        # each clip from the one holding the first new row is encoded corrected, then as decoded, with a frame of the next clip
+        self.assertEqual([len(p) for p in vae.encoded], [18, 18] * 9 + [5, 5])
+        fixed = torch.cat([p[:17] for p in vae.encoded[0::2]])  # frames 34 on
+        new, original = fixed[5:], vae.frames[39:]
+        self.assertTrue(torch.equal(fixed[:5], vae.frames[34:39]))
+        # the 3-8 px and 8-20 px bands, 30% rougher than the held frames, come back to within 10% of them and not below; the
+        # 1-3 px band stays within 5% of the sampled one
+        for band in (mid, coarse):
+            self.assertGreater(energy(band, original) / energy(band, vae.frames[1:34]), 1.25)
+            self.assertTrue(0.98 < energy(band, new) / energy(band, vae.frames[1:34]) < 1.1)
+        self.assertLess(abs(energy(fine, new) / energy(fine, original) - 1), 0.05)
+        # the new rows take the difference the corrected frames encode to
+        self.assertTrue(torch.allclose(video[:, :, 12:15] - before_video[:, :, 12:15], (vae.encoded[0].mean() - vae.encoded[1].mean()).expand(1, 24, 3, 4, 6), atol=1e-6))
+        # never more than the floor in one take, and half the strength goes about half the way
+        floored = FrameVAE(3.0)
+        hold(take, floored, floor=0.6)
+        ratio = energy(mid, torch.cat([p[:17] for p in floored.encoded[0::2]])[5:]) / energy(mid, floored.frames[39:])
+        self.assertTrue(0.59 < ratio < 0.7)
+        half = FrameVAE(1.3)
+        hold(take, half, strength=0.5)
+        softened = energy(mid, torch.cat([p[:17] for p in half.encoded[0::2]])[5:])
+        self.assertAlmostEqual(softened, (energy(mid, new) + energy(mid, original)) / 2, delta=0.03 * softened)
+        # a take that came out smoother than its held frames keeps its texture: the hold never sharpens, and only a window where a
+        # material's edge shifted gets a touch softer
+        smoother = FrameVAE(0.6)
+        hold(take, smoother)
+        kept = torch.cat([p[:17] for p in smoother.encoded[0::2]])[5:]
+        for band in (mid, coarse):
+            self.assertTrue(0.98 < energy(band, kept) / energy(band, smoother.frames[39:]) < 1.005)
+        # texture that only moved, about as much of it over the whole picture as in the held frames, keeps all but the few percent the
+        # 3% slack lets go where it gathered
+        moved = FrameVAE(1.0, moved=True)
+        hold(take, moved)
+        kept = torch.cat([p[:17] for p in moved.encoded[0::2]])[5:]
+        for band in (mid, coarse):
+            top = lambda frames: band(frames.movedim(-1, 1))[..., 4:28, :][..., away].std().item()
+            self.assertGreater(top(kept) / top(moved.frames[39:]), 0.93)
+        # no mask and a root pass through
+        for latent in ({"samples": take["samples"]}, dict(take, noise_mask=NestedTensor((torch.ones(1, 1, 57, 4, 6), torch.ones(1, 1, 2, 320))))):
+            self.assertIs(hold(latent, vae), latent)
+
     def test_the_check_reports_the_new_frames_against_the_held_ones(self):
         take = fake_latent(192, 0)
         held = torch.ones(1, 1, 57, 4, 6)
