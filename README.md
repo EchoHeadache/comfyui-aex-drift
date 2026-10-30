@@ -85,6 +85,12 @@ A later chain of two animated people showed two faults, both fixed since:
 - One extend drifted by about 3 codes, enough that only 6% of its picture counted as still, so Seam Anchor left it alone and its back wall darkened by 4–5 codes. The still test now takes out up to half the tolerance of whole-picture drift; the same latent counts 13% as still, and the wall stays within about a code of the held frame at five of six sampled frames (2.7 codes down at the sixth).
 - Where a window had little still picture, Seam Anchor used to apply the whole picture's grade, fitted on the background. On a moving face that grade lowered G − B by 2–4 codes, a pink cast. The grade now fades out there, and the face keeps the color it had without the anchor.
 
+## Known issues
+
+**Neon patches with Handoff Match.** In two two-stage extends, each rendered twice from the same parent and seed, the take with Handoff Match on developed neon patches and the take with it bypassed didn't. The patches showed on a moving subject: blown-out, oversaturated color with crushed black beside it, fixed in screen position while the subject moved. They form during the second stage's sampling and already show in its preview, before the decode. Seam Anchor doesn't cause them and AEX Drift Check doesn't detect them.
+
+So far they have been seen only at Handoff Match `strength` 1.0, not yet at 0.9, the default. If a take shows them, render it again with another seed, or lower `strength` or bypass the node. Without Handoff Match the background came out 1–2 px squished vertically in one scene, though not in another.
+
 ## Tests
 
 ```
