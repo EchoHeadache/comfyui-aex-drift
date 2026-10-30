@@ -1,0 +1,8 @@
+[project]
+name = "comfyui-aex-drift"
+version = "0.1.0"
+description = "Hold MiniMax H3 extends made with the obvpm Timeline to the tone of the clip they continue, and check how far they moved"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = []
