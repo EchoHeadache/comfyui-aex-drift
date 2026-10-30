@@ -5,6 +5,7 @@
 
 import importlib.util
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from comfy.cli_args import args as comfy_args
 comfy_args.cpu = True
 import torch
 
+import folder_paths
 from comfy.nested_tensor import NestedTensor
 from comfy_extras.nodes_minimax_h3 import EmptyMiniMaxH3LatentAV
 
@@ -182,7 +184,7 @@ class DriftTest(unittest.TestCase):
         take["noise_mask"] = NestedTensor((held, torch.ones(1, 1, 2, 320)))
         torch.manual_seed(0)
         picture = 0.2 + 0.6 * torch.nn.functional.interpolate(torch.rand(1, 3, 4, 6), size=(64, 96), mode="bilinear").movedim(1, -1)
-        check = lambda images, latent=take, on=True: drift.AEXDriftCheck.execute(images=images, latent=latent, check=on).ui.as_dict()["text"][0]
+        check = lambda images, latent=take, on=True: drift.AEXDriftCheck.execute(images=images, latent=latent, check=on, save=False, filename_prefix="aex-drift/check").ui.as_dict()["text"][0]
         rows = lambda text: [[float(v.rstrip("%")) for v in line.split()] for line in text.splitlines() if line.split()[:1] and line.split()[0].lstrip("+-").isdigit()]
         darker = picture.repeat(192, 1, 1, 1)
         darker[39:] -= 2 / 219  # two codes of Y darker, the same color
@@ -203,6 +205,16 @@ class DriftTest(unittest.TestCase):
         root = dict(take, noise_mask=NestedTensor((torch.ones(1, 1, 57, 4, 6), torch.ones(1, 1, 2, 320))))
         for text in (check(darker[35:]), check(darker, root), check(darker, {"samples": take["samples"]}), check(darker, on=False)):
             self.assertEqual(rows(text), [])
+        # the save switch writes the report the node shows, numbered like the other save nodes
+        with tempfile.TemporaryDirectory() as out:
+            output_directory = folder_paths.get_output_directory()
+            folder_paths.set_output_directory(out)
+            try:
+                saved = [drift.AEXDriftCheck.execute(images=darker, latent=take, check=True, save=True, filename_prefix="drift/take").ui for _ in range(2)]
+            finally:
+                folder_paths.set_output_directory(output_directory)
+            self.assertEqual([s["files"][0]["filename"] for s in saved], ["take_00001.txt", "take_00002.txt"])
+            self.assertEqual((Path(out) / "drift" / "take_00001.txt").read_text(encoding="utf-8"), saved[0]["text"][0] + "\n")
 
         # the suggestions weigh what is left against which way Seam Anchor graded, from its record on the latent
         record = lambda **kw: dict(dict(strength=1.0, region=0.2, detail=1.0, still_tolerance=6.0, min_still=0.1, share=0.9, graded=True,

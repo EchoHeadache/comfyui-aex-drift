@@ -9,9 +9,11 @@ AEX Drift Check shows on the node how far the decoded take still moved off its h
 """
 
 import logging
+import os
 
 import torch
 
+import folder_paths
 from comfy.latent_formats import MiniMaxH3Video
 from comfy.nested_tensor import NestedTensor
 from comfy_api.latest import ComfyExtension, io, ui
@@ -401,19 +403,31 @@ class AEXDriftCheck(io.ComfyNode):
             description="Shows on the node how an extend's new frames moved off the frames it holds from the clip it continues: over the "
                         "picture that holds still, the shift of seven luma percentiles from the near blacks to the highlights, and the "
                         "change of contrast, texture and saturation, a few frames after the hold and at the end, and which Seam Anchor "
-                        "knob to try next. Both sides come from the same decode.",
+                        "knob to try next. Both sides come from the same decode. It can also save the report as a text file.",
             inputs=[
                 io.Image.Input("images", tooltip="The untrimmed decode of the latent: H3 VAE Decode's frames, as the save node gets them."),
                 io.Latent.Input("latent", tooltip="The latent those frames were decoded from, with Apply Pins' noise mask: Seam Anchor's output."),
                 io.Boolean.Input("check", default=True, label_on="on", label_off="off", tooltip="Off skips the check."),
+                io.Boolean.Input("save", default=False, label_on="on", label_off="off", tooltip="On also saves the report as a .txt file in the output folder."),
+                io.String.Input("filename_prefix", default="aex-drift/check",
+                                tooltip="The saved report's name in the output folder, as in the other save nodes: a subfolder before the last slash, then a counter and .txt are added."),
             ],
             outputs=[],
             is_output_node=True,
         )
 
     @classmethod
-    def execute(cls, images, latent, check) -> io.NodeOutput:
-        return io.NodeOutput(ui=ui.PreviewText(drift_check(images, latent) if check else "Check off."))
+    def execute(cls, images, latent, check, save, filename_prefix) -> io.NodeOutput:
+        if not check:
+            return io.NodeOutput(ui=ui.PreviewText("Check off."))
+        text = drift_check(images, latent)
+        if not save:
+            return io.NodeOutput(ui=ui.PreviewText(text))
+        folder, filename, counter, subfolder, _ = folder_paths.get_save_image_path(filename_prefix, folder_paths.get_output_directory())
+        file = f"{filename}_{counter:05}.txt"
+        with open(os.path.join(folder, file), "w", encoding="utf-8") as f:
+            f.write(text + "\n")
+        return io.NodeOutput(ui={"text": (text,), "files": [ui.SavedResult(file, subfolder, io.FolderType.output)]})
 
 
 class DriftExtension(ComfyExtension):

@@ -56,7 +56,7 @@ Under the table it suggests which knob to try next, judged from frames +32 on, o
 
 A shift counts at 0.5 codes of p10–p75, 1 point of the <=18 share, 0.5% contrast, 2% texture, 3% saturation, or 1 code for a patch. These are starting points from our tests: with Seam Anchor, takes stayed within about half a code, while without it the mids dropped one to two codes per extend. Each suggestion is one step (`strength` ±0.2, `detail` ±0.25, `region` ×0.75), so confirm it with an A/B. The check doesn't measure geometry, so it has no suggestion for Handoff Match.
 
-The `check` switch turns it off. The report also goes to the console log.
+The `check` switch turns it off. The report also goes to the console log. With `save` on, it is also written to a `.txt` file in the output folder, named by `filename_prefix` (default `aex-drift/check`) and numbered like the other save nodes' files.
 
 ## Knobs
 

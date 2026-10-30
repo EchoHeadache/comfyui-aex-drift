@@ -17,4 +17,12 @@ app.registerExtension({
             updateTextPreviewWidgets(this, message);
         };
     },
+    // a tab switch or an undo rebuilds the node with an empty preview; put the last report back, as Preview Any does
+    onNodeOutputsUpdated(outputs) {
+        const { updateTextPreviewWidgets } = window.comfyAPI.textPreviewWidgets;
+        for (const [id, output] of Object.entries(outputs)) {
+            const node = app.rootGraph.getNodeById(id);
+            if (node?.type === "AEXDriftCheck") updateTextPreviewWidgets(node, output);
+        }
+    },
 });
