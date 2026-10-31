@@ -166,6 +166,9 @@ def gauss(x, s):
 
 
 MATERIALS = 8  # colour clusters the texture hold measures separately, before merging near-duplicates
+JUMP = 1.35  # a window whose texture energy rose past this many times the held level changed content rather than texture
+PASSES = 6  # measure-and-soften rounds per frame: the fine guard passes about half of a 3-8 px change per round
+FLOOR_WHOLE = 0.97  # a material is softened only down to this share of its held energy over the whole picture
 
 
 def texture_hold(latent, vae, strength, window, floor):
@@ -198,6 +201,7 @@ def texture_hold(latent, vae, strength, window, floor):
     dev = comfy.model_management.get_torch_device()
     luma = torch.tensor([0.2126, 0.7152, 0.0722], device=dev).view(1, 3, 1, 1)
     k = max(16, int(window * frames.shape[2]))
+    enough = 1600 / k ** 2  # the share of a window a material must own to be measured there: about 1600 pixels
     load = lambda f: frames[f].to(dev).movedim(-1, 0)[None].float()
     pool = lambda x: torch.nn.functional.avg_pool2d(x, k, stride=k // 2, ceil_mode=True)
 
@@ -241,38 +245,42 @@ def texture_hold(latent, vae, strength, window, floor):
     for f in ref:
         _, _, e, n = measure(load(f))
         total, present = total + e, present + n
-    there = (present / len(ref) > 0.1)[:, None]
+    there = (present / len(ref) > enough)[:, None]
     whole = total.sum((2, 3)) / present.sum((1, 2))[:, None].clamp_min(1e-6)  # each material's energy over the whole held picture
     known = (present.sum((1, 2)) > 0)[:, None, None, None]  # a material the held frames don't show has nothing to be held to
     target = torch.where(there, total / present[:, None].clamp_min(1e-6), whole[..., None, None]).sqrt()
-    measured, gain = [], []
+    measured, gain, seen = [], [], []
     for f in range(first, frames.shape[0]):
         _, _, e, n = measure(load(f))
         m = (e / n[:, None].clamp_min(1e-6)).sqrt()
-        # a material that barely touches this window keeps its texture
-        cut = torch.where((n > 0.1)[:, None] & known, 1 - (target / m.clamp_min(1e-6)).clamp(floor, 1.0), 0.0)
+        # a material that barely touches this window keeps its texture, and so does one whose energy there jumped by more than
+        # an extend's roughening does (a hand moving onto a face, a turn of the head, a light): that is new content, not texture
+        cut = torch.where((n > enough)[:, None] & known & (m < JUMP * target), 1 - (target / m.clamp_min(1e-6)).clamp(floor, 1.0), 0.0)
         # a subject that turns or moves carries its texture from window to window; a material is softened only as far as its
         # energy over the whole picture rose, to within 3% of the held level, so a cat that turned its head keeps its fur
         a, b = (e * cut ** 2).sum((2, 3)), (e * cut).sum((2, 3))
-        c = e.sum((2, 3)) - whole * n.sum((1, 2))[:, None] * 0.97 ** 2
+        c = e.sum((2, 3)) - whole * n.sum((1, 2))[:, None] * FLOOR_WHOLE ** 2
         keep = ((b - (b ** 2 - a * c).clamp_min(0).sqrt()) / a.clamp_min(1e-12)).clamp(0.0, 1.0)  # the share of the cut that lands there
         keep = torch.where(c <= 0, 0.0, torch.where(a - 2 * b + c >= 0, 1.0, keep))
-        gain.append(1 - keep[..., None, None] * cut)
+        gain.append(keep[..., None, None] * cut)
+        seen.append((n > enough)[:, None].expand_as(cut).to(cut))
         measured.append(m)
-    measured, gain = torch.stack(measured), torch.stack(gain)
-    # smoothed over about a third of a second, so the softening doesn't flicker
-    kt = torch.exp(-torch.arange(-12, 13, device=dev, dtype=gain.dtype) ** 2 / 32)
-    g = torch.nn.functional.conv1d(torch.nn.functional.pad(gain.flatten(1).T[:, None], (12, 12), mode="replicate"), (kt / kt.sum()).view(1, 1, -1))
-    gain = 1 + strength * (g[:, 0].T.view(gain.shape) - 1)
+    measured, cut, seen = torch.stack(measured), torch.stack(gain), torch.stack(seen)
+    # smoothed over about a third of a second, so the softening doesn't flicker; frames where the material isn't in the window
+    # say nothing about its texture there and are left out of the average rather than counted as no cut
+    kt = torch.exp(-torch.arange(-12, 13, device=dev, dtype=cut.dtype) ** 2 / 32)
+    smooth = lambda v: torch.nn.functional.conv1d(torch.nn.functional.pad(v.flatten(1).T[:, None], (12, 12), mode="replicate"),
+                                                  (kt / kt.sum()).view(1, 1, -1))[:, 0].T.view(v.shape)
+    gain = 1 - strength * smooth(cut * seen) / smooth(seen).clamp_min(1e-6)
 
     def soften(f):
         x = load(f)
         out, g = x, gain[f - first]
         aim = measured[f - first] * g
-        for i in range(3):
+        for i in range(PASSES):
             w, b, e, n = measure(out)
-            if i:  # the bilinear map and the blur share each window's gain with its neighbours, so measure again and take the rest
-                g = torch.where((n > 0.1)[:, None], (aim / (e / n[:, None].clamp_min(1e-6)).sqrt().clamp_min(1e-6)).clamp(max=1.0), 1.0)
+            if i:  # the bilinear map and the blur pass only part of each window's gain, so measure again and take the rest
+                g = torch.where((n > enough)[:, None], (aim / (e / n[:, None].clamp_min(1e-6)).sqrt().clamp_min(1e-6)).clamp(max=1.0), 1.0)
             gmap = torch.nn.functional.interpolate(g.flatten(0, 1)[None], size=x.shape[-2:], mode="bilinear", align_corners=False)[0]
             gmap = (w[:, None] * gmap.view(materials, 2, *x.shape[-2:])).sum(0)
             # blurred, so the change reaches nothing finer than the mid band and the fine band stays as sampled
