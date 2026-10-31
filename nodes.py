@@ -15,7 +15,6 @@ import torch
 
 import comfy.model_management
 import folder_paths
-from comfy.latent_formats import MiniMaxH3Video
 from comfy.nested_tensor import NestedTensor
 from comfy_api.latest import ComfyExtension, io, ui
 
@@ -51,45 +50,94 @@ def first_stage_pins(latent, pins, pin_specs, vae):
     return dict(latent, samples=NestedTensor((video, audio)))
 
 
-def handoff_match(latent, unpinned, strength):
+def row_start(r):
+    """First frame of latent row r: each group of 5 rows is 1 frame, then 4 per row."""
+    return r // 5 * 17 + (0, 1, 5, 9, 13)[r % 5]
+
+
+SPACE = torch.tensor([[0.2126, 0.7152, 0.0722], [-0.1146, -0.3854, 0.5], [0.5, -0.4542, -0.0458]])  # Seam Anchor grades BT.709 Y, Cb, Cr
+
+
+def low_pass(x):
+    """(N, 3, H, W) frames -> their 80 px low frequencies on the 16 px block grid of the latent, (N, 3, H / 16, W / 16)."""
+    return torch.nn.functional.avg_pool2d(torch.nn.functional.avg_pool2d(x, 16), 5, stride=1, padding=2, count_include_pad=False)
+
+
+def encode_change(video, new, vae, frames, corrected):
+    """Carry a change of the decoded frames into the new rows: each 17-frame clip from the one holding the first new row is encoded as
+    corrected(clip) and as decoded, and the difference goes to its new rows, which leaves out the VAE round trip's own error. The VAE
+    encodes each clip on its own and drops the last 3 latent steps of every call, so one frame of the next clip goes along."""
+    video = video.clone()
+    for c in range(new[0] // 5, (video.shape[2] + 4) // 5):
+        rows = [t for t in range(c * 5, c * 5 + 5) if t in new]
+        clip = frames[c * 17:c * 17 + 18]
+        diff = (vae.encode(corrected(c, clip)) - vae.encode(clip)).to(video)
+        video[:, :, rows] += diff[:, :, [t - c * 5 for t in rows]]
+    return video
+
+
+def handoff_match(latent, unpinned, vae, strength):
     """Grade a two-stage take's new rows into its held rows before the second stage samples it.
 
     The second stage's Apply Pins swaps the held rows of the latent-upscaled first stage for the clip's exact latent, while the new
     rows keep the first stage's look: re-encoded at the small size and upscaled. The second stage then grows a new frame next to a
-    held one that it does not quite match, and the join comes out with crushed shadows and more contrast. Both copies of the held rows
-    show the same picture, so they measure that look: a gain and offset per channel of the low frequencies, applied to the new rows."""
+    held one that it does not quite match. Both copies of the held rows show the same picture, so decoded they measure that look: a
+    gain and offset per colour channel of the 80 px low frequencies, applied to the decoded new rows and encoded back into them.
+    Fitted in the latent instead, the offset also took in what the soft copy lacks (the exact rows' detail lives in the means of
+    some channels), and added to the new rows it told the second stage there was detail there: at its first steps, where the noise
+    nearly hides the picture, it read that as light and blew out a forehead or a cheek."""
     mask = latent.get("noise_mask")
     if unpinned is None or mask is None:
         return latent
-    held = mask.unbind()[0][0, 0].amin(dim=(1, 2)) < 1  # the rows Apply Pins wrote
-    if not held.any():
+    held = (mask.unbind()[0][0, 0].amin(dim=(1, 2)) < 1).tolist()  # the rows Apply Pins wrote
+    new = [t for t, h in enumerate(held) if not h]
+    # held rows with two held rows (or the clip's end) after them: the decoder's two steps of lookahead don't reach the new rows
+    clear = [t for t, h in enumerate(held) if h and all(held[t + 1:t + 3])]
+    if not clear or not new:
         return latent
     video, audio = latent["samples"].unbind()
-    blur = lambda x: torch.nn.functional.avg_pool3d(x, (1, 5, 5), stride=1, padding=(0, 2, 2), count_include_pad=False)
-    low = blur(video)
-    exact, copy = low[:, :, held], blur(unpinned["samples"].unbind()[0])[:, :, held]
-    spread = copy.std(dim=(0, 2, 3, 4))
-    gain = torch.where(spread > 0.05, exact.std(dim=(0, 2, 3, 4)) / spread, 1.0)  # a blank held window (a fade) has no contrast to measure
-    shift = exact.mean(dim=(0, 2, 3, 4)) - gain * copy.mean(dim=(0, 2, 3, 4))
-    video = video.clone()
-    video[:, :, ~held] += strength * ((gain - 1).view(1, -1, 1, 1, 1) * low + shift.view(1, -1, 1, 1, 1))[:, :, ~held]
-    logging.info("AEX Drift: handoff match graded %d new latent steps to %d held ones (channel gains %.2f to %.2f).",
-                 int((~held).sum()), int(held.sum()), gain.min(), gain.max())
+    dev = comfy.model_management.get_torch_device()
+    ref = [f for t in clear for f in range(row_start(t), row_start(t + 1))]
+    frames = vae.decode(video)
+    frames = frames.reshape((-1,) + frames.shape[-3:])
+    copy = vae.decode(unpinned["samples"].unbind()[0][:, :, :max(clear) + 3])
+    copy = copy.reshape((-1,) + copy.shape[-3:])
+    low = lambda fr, idx: torch.cat([low_pass(fr[idx[i:i + 16]].to(dev).float().movedim(-1, 1)) for i in range(0, len(idx), 16)]) * 255
+    exact, soft = low(frames, ref), low(copy, ref)
+    spread = soft.std(dim=(0, 2, 3))
+    gain = torch.where(spread > 0.5, exact.std(dim=(0, 2, 3)) / spread, 1.0)  # a blank held window (a fade) has no contrast to measure
+    shift = exact.mean(dim=(0, 2, 3)) - gain * soft.mean(dim=(0, 2, 3))
+    graded = {f for t in new for f in range(row_start(t), row_start(t + 1))}
+
+    def corrected(c, clip):
+        out = clip.clone()
+        for i in range(len(clip)):
+            if c * 17 + i in graded:
+                x = clip[i].to(dev).float().movedim(-1, 0)[None]
+                lo = torch.nn.functional.interpolate(low_pass(x), size=x.shape[-2:], mode="bilinear", align_corners=False) * 255
+                out[i] = (x + strength * ((gain - 1).view(1, 3, 1, 1) * lo + shift.view(1, 3, 1, 1)) / 255).clamp(0.0, 1.0)[0].movedim(0, -1).to(out)
+        return out
+
+    video = encode_change(video, new, vae, frames, corrected)
+    logging.info("AEX Drift: handoff match graded %d new latent steps to %d held ones (RGB gains %.3f %.3f %.3f, offsets %+.1f %+.1f %+.1f codes).",
+                 len(new), sum(held), *gain.tolist(), *shift.tolist())
     return dict(latent, samples=NestedTensor((video, audio)))
 
 
-def seam_anchor(latent, strength, region, detail, still_tolerance, min_still):
+def seam_anchor(latent, vae, strength, region, detail, still_tolerance, min_still):
     """Grade an extend's new rows back to the tone of its held rows once the last stage has sampled them.
 
     H3 drifts as it samples: over the first few dozen new frames the low mids darken a code or two and contrast grows by a
     percent or so, with one stage or two, and a root drifts within itself as well. An extend shows it next to its parent, and
     the next extend continues from the drifted latent. Where the picture holds still the new rows should look like the held
-    ones, so the low frequencies get a gain and offset per channel and the detail a gain per channel, fitted there row by row
-    and smoothed over time, in the latent the take is decoded and saved from. The low frequencies are fitted over windows about
-    a fifth of the frame wide: the drift differs by region, and one grade for the whole picture left a door darkening. Where
-    little of a window holds still, as on a moving subject, its grade fades out rather than borrowing the background's. A
-    luma-only grade along the preview's factors moved the decoded tone too little: the decoder's tone lives in more channels
-    than the preview's linear fit says."""
+    ones, so the decoded frames get a gain and offset per colour channel of the low frequencies and a gain per channel of the
+    detail, fitted there row by row against the held row at the same place in its group and smoothed over time. The low
+    frequencies are fitted over windows about a fifth of the frame wide: the drift differs by region, and one grade for the
+    whole picture left a door darkening. Where little of a window holds still, as on a moving subject, its grade fades out rather
+    than borrowing the background's. Each latent row gets one correction for all of its frames, and the change goes back into the
+    latent by encoding. Graded channel by channel in the latent instead, the grade put a flicker into still areas: the decoder
+    draws some channels as change between the 4 frames of a row, and a grade that varied from window to window moved them, so
+    patches went a code darker on every row's third frame."""
     mask = latent.get("noise_mask")
     if mask is None:
         return latent
@@ -100,56 +148,80 @@ def seam_anchor(latent, strength, region, detail, still_tolerance, min_still):
         return latent
     # what the anchor did, for AEX Drift Check
     report = dict(strength=strength, region=region, detail=detail, still_tolerance=still_tolerance, min_still=min_still, share=None, graded=False)
-    if h < 5:
+    clear = h - 2  # held rows the decoder's two steps of lookahead into the new rows don't reach
+    if clear < 5:
         return dict(latent, aex_drift_anchor=report)
-    # the latent comes in groups of 5 steps per 17 frames (one 1-frame step, then four 4-frame ones), so each new step is
-    # measured against the held step at the same place in its group
-    ref = [h - 5 + (t - h) % 5 for t in new]
+    # each new row is measured against the last clear held row at the same place in its group of 5 (one 1-frame row, then four
+    # 4-frame ones): the decoder draws them a little differently
+    ref = {t: clear - 5 + (t - clear) % 5 for t in new}
     video, audio = latent["samples"].unbind()
-    toward_luma = torch.tensor(MiniMaxH3Video.latent_rgb_factors).to(video) @ torch.tensor([0.2126, 0.7152, 0.0722]).to(video)
-    luma = torch.einsum("bcthw,c->bthw", video, toward_luma)
+    frames = vae.decode(video)
+    frames = frames.reshape((-1,) + frames.shape[-3:])
+    dev = comfy.model_management.get_torch_device()
+    space = SPACE.to(dev)
+    load = lambda f: torch.einsum("ij,jhw->ihw", space, frames[f].to(dev).float().movedim(-1, 0))
+    span = lambda r: range(row_start(r), row_start(r + 1))
+    rows = sorted(set(new) | set(ref.values()))
+    # each row's frames averaged on the 16 px block grid, in codes
+    blocks = {r: torch.stack([torch.nn.functional.avg_pool2d(load(f)[None], 16)[0] for f in span(r)]).mean(0) * 255 for r in rows}
+    luma = (torch.tensor([0.2126, 0.7152, 0.0722], device=dev) @ torch.linalg.inv(space)).view(3, 1, 1)
     box = lambda x: torch.nn.functional.avg_pool2d(x, 3, stride=1, padding=1, count_include_pad=False)
-    change = (box(luma[:, new]) - box(luma[:, ref])) * 127.5  # in codes of preview luma
+    change = box(torch.stack([(blocks[t] * luma).sum(0) for t in new])) - box(torch.stack([(blocks[ref[t]] * luma).sum(0) for t in new]))
     # a drift of the whole picture by up to half the tolerance is no motion, so each new row's median change is taken out up to
     # that much: an extend that darkened by about 3 codes otherwise counted 6% of its picture as still and was left alone
-    change = change - change.flatten(2).median(dim=2).values[..., None, None].clamp(-still_tolerance / 2, still_tolerance / 2)
-    still = (change.abs() < still_tolerance).all(dim=1).all(dim=0)
+    change = change - change.flatten(1).median(dim=1).values[:, None, None].clamp(-still_tolerance / 2, still_tolerance / 2)
+    still = (change.abs() < still_tolerance).all(dim=0)
     share = report["share"] = still.float().mean().item()
     if share < min_still:
         logging.info("AEX Drift: seam anchor left the take alone, only %d%% of the picture holds still.", share * 100)
         return dict(latent, aex_drift_anchor=report)
-    blur = lambda x: torch.nn.functional.avg_pool3d(x, (1, 5, 5), stride=1, padding=(0, 2, 2), count_include_pad=False)
-    low, target = blur(video[:, :, new]), blur(video[:, :, ref])
+    blur = lambda x: torch.nn.functional.avg_pool2d(x, 5, stride=1, padding=2, count_include_pad=False)
+    low, target = blur(torch.stack([blocks[t] for t in new])), blur(torch.stack([blocks[ref[t]] for t in new]))
     x, t = low[..., still], target[..., still]
-    spread = x.std(dim=(0, 3))
-    whole = torch.where(spread > 0.05, t.std(dim=(0, 3)) / spread, 1.0)[..., None, None]
-    gain, shift = whole, t.mean(dim=(0, 3))[..., None, None] - whole * x.mean(dim=(0, 3))[..., None, None]
+    spread = x.std(dim=(0, 2))
+    whole = torch.where(spread > 0.25, t.std(dim=(0, 2)) / spread, 1.0)[None, :, None, None]
+    gain, shift = whole, t.mean(dim=(0, 2))[None, :, None, None] - whole * x.mean(dim=(0, 2))[None, :, None, None]
     if region > 0:
-        # the same fit over the still pixels of a window around each latent pixel, odd so it centers there
-        k = int(region * video.shape[4]) | 1
-        w = still.to(video)
+        # the same fit over the still pixels of a window around each block, odd so it centers there
+        k = int(region * still.shape[1]) | 1
+        w = still.to(low)
         pool = lambda s: torch.nn.functional.avg_pool2d(s.flatten(0, -3), k, stride=1, padding=k // 2, count_include_pad=False).view(s.shape)
         n = pool(w[None])[0]
-        mean = lambda s: (pool(s * w) / n.clamp_min(1e-6)).mean(dim=0)
+        mean = lambda s: pool(s * w) / n.clamp_min(1e-6)
         mx, mt = mean(low), mean(target)
         sx, st = (mean(low ** 2) - mx ** 2).clamp_min(0).sqrt(), (mean(target ** 2) - mt ** 2).clamp_min(0).sqrt()
-        local = torch.where(sx > 0.05, st / sx, whole).clamp(0.5, 2.0)  # a window with only a few still pixels can fit wild gains
+        local = torch.where(sx > 0.25, st / sx, whole).clamp(0.5, 2.0)  # a window with only a few still pixels can fit wild gains
         # windows less than a quarter still fade toward no grade: in a test the whole picture's grade, fitted on the background,
         # turned a moving face pink, while left alone the face kept its color
         trust = (n / 0.25).clamp(max=1.0)
         gain, shift = trust * local + 1 - trust, trust * (mt - local * mx)
-    high = video[:, :, new] - low
-    spread = high[..., still].std(dim=(0, 3))
-    sharp = torch.where(spread > 0.05, (video[:, :, ref] - target)[..., still].std(dim=(0, 3)) / spread, 1.0)[..., None, None]
-    smooth = lambda s: torch.nn.functional.avg_pool3d(s[None], (9, 1, 1), stride=1, padding=(4, 0, 0), count_include_pad=False)[0]
-    gain, shift, sharp = smooth(gain), smooth(shift), smooth(sharp)
+    smooth = lambda s: torch.nn.functional.avg_pool1d(s.flatten(1).T[:, None], 9, stride=1, padding=4, count_include_pad=False)[:, 0].T.view(s.shape)
+    gain, shift = smooth(gain.expand_as(low)), smooth(shift.expand_as(low))
     fix = (gain - 1) * low + shift
-    video = video.clone()
-    video[:, :, new] += strength * (fix + detail * (sharp - 1) * high)
-    # which way the grade moves the still picture at strength 1: its preview luma in codes, the contrast of that luma, and the detail
-    before = luma[:, new][..., still]
-    after = before + torch.einsum("bcthw,c->bthw", fix, toward_luma)[..., still]
-    report.update(graded=True, tone=(after - before).mean().item() * 127.5, contrast=(after.std(dim=-1) / before.std(dim=-1)).mean().item() - 1,
+    # the detail, finer than the 80 px low frequencies, per channel over the still pixels of a row's frames
+    up = lambda m: torch.nn.functional.interpolate(m, size=frames.shape[1:3], mode="bilinear", align_corners=False)
+    high = lambda x: x - up(low_pass(x[None]))[0]
+    still_px = up(still[None, None].float())[0, 0] > 0.5
+    detail_spread = {r: torch.cat([high(load(f))[:, still_px] for f in span(r)], dim=1).std(dim=1) for r in rows}
+    sharp = smooth(torch.stack([torch.where(detail_spread[t] > 1e-4, detail_spread[ref[t]] / detail_spread[t], 1.0) for t in new]))
+    row_of = {f: i for i, t in enumerate(new) for f in span(t)}
+    back = torch.linalg.inv(space)
+
+    def corrected(c, clip):
+        out = clip.clone()
+        for i in range(len(clip)):
+            j = row_of.get(c * 17 + i)
+            if j is not None:
+                x = torch.einsum("ij,jhw->ihw", space, clip[i].to(dev).float().movedim(-1, 0))
+                x = x + strength * (up(fix[j:j + 1])[0] / 255 + detail * (sharp[j] - 1).view(3, 1, 1) * high(x))
+                out[i] = torch.einsum("ij,jhw->ihw", back, x).clamp(0.0, 1.0).movedim(0, -1).to(out)
+        return out
+
+    video = encode_change(video, new, vae, frames, corrected)
+    # which way the grade moves the still picture at strength 1: its luma in codes, the contrast of that luma, and the detail
+    before = (low * luma).sum(1)[..., still]
+    after = before + (fix * luma).sum(1)[..., still]
+    report.update(graded=True, tone=(after - before).mean().item(), contrast=(after.std(dim=-1) / before.std(dim=-1)).mean().item() - 1,
                   texture=sharp.mean().item() - 1)
     logging.info("AEX Drift: seam anchor graded %d new latent steps over %d%% still picture (channel gains %.2f to %.2f over the "
                  "whole picture, detail gains %.2f to %.2f).", len(new), share * 100, whole.min(), whole.max(), sharp.min(), sharp.max())
@@ -195,9 +267,8 @@ def texture_hold(latent, vae, strength, window, floor):
     video, audio = latent["samples"].unbind()
     frames = vae.decode(video)
     frames = frames.reshape((-1,) + frames.shape[-3:])
-    start = lambda r: r // 5 * 17 + (r % 5 and 1 + 4 * (r % 5 - 1))  # first frame of a latent row: 1, 4, 4, 4, 4 frames per group of 5
-    ref = range(1, start(h - 2))  # held frames clear of the decoder's two steps of lookahead into the new rows
-    first = start(new[0])
+    ref = range(1, row_start(h - 2))  # held frames clear of the decoder's two steps of lookahead into the new rows
+    first = row_start(new[0])
     dev = comfy.model_management.get_torch_device()
     luma = torch.tensor([0.2126, 0.7152, 0.0722], device=dev).view(1, 3, 1, 1)
     k = max(16, int(window * frames.shape[2]))
@@ -287,15 +358,8 @@ def texture_hold(latent, vae, strength, window, floor):
             out = out + gauss((gmap[0] - 1) * b[0] + (gmap[1] - 1) * b[1], 2.5)
         return out[0].movedim(0, -1).clamp(0.0, 1.0)
 
-    video = video.clone()
-    for c in range(new[0] // 5, (len(held) + 4) // 5):
-        # the VAE encodes each 17-frame clip on its own and drops the last 3 latent steps of every call, so one frame of the next
-        # clip goes along to keep this clip's 5 steps
-        clip = frames[c * 17:c * 17 + 18]
-        fixed = torch.stack([soften(f).to(clip) if first <= f < c * 17 + 17 else clip[f - c * 17] for f in range(c * 17, c * 17 + len(clip))])
-        rows = [t for t in range(c * 5, c * 5 + 5) if t in new]
-        diff = (vae.encode(fixed) - vae.encode(clip)).to(video)
-        video[:, :, rows] += diff[:, :, [t - c * 5 for t in rows]]
+    corrected = lambda c, clip: torch.stack([soften(f).to(clip) if first <= f < c * 17 + 17 else clip[f - c * 17] for f in range(c * 17, c * 17 + len(clip))])
+    video = encode_change(video, new, vae, frames, corrected)
     logging.info("AEX Drift: texture hold softened %d new frames toward %d held ones over %d materials (3-8 px band gains %.2f to 1, "
                  "8-20 px %.2f to 1, on average %.3f and %.3f).", frames.shape[0] - first, len(ref), materials,
                  gain[:, :, 0].min(), gain[:, :, 1].min(), gain[:, :, 0].mean(), gain[:, :, 1].mean())
@@ -402,7 +466,7 @@ def advise(anchor, settled, worst, held_steps, p2, p98):
         out.append("No Seam Anchor record on this latent (bypassed, or not wired before the check): these numbers are the take's own drift."
                    + (f" Seam Anchor would grade it ({', '.join(found)})." if found else ""))
     elif anchor["share"] is None:
-        out.append(f"Seam Anchor needs 5 held latent steps and this take holds {held_steps}: hold 39 frames (12 steps).")
+        out.append(f"Seam Anchor needs 7 held latent steps and this take holds {held_steps}: hold 39 frames (12 steps).")
     elif not anchor["graded"]:
         out.append(f"Seam Anchor left this take alone: {anchor['share']:.0%} of the picture held still, under min_still {anchor['min_still']:g}. "
                    f"If the camera is locked off, lower min_still, or raise still_tolerance from {anchor['still_tolerance']:g} when slow motion or "
@@ -484,11 +548,12 @@ class AEXDriftHandoffMatch(io.ComfyNode):
             display_name="AEX Drift Handoff Match",
             category="aex-drift",
             description="Grades the new rows of a two-stage take's second-stage latent into its held rows. Apply Pins swaps the exact "
-                        "latent in for the first stage's upscaled copy of the held frames; the difference between the two copies is the "
-                        "first stage's look, and it is taken out of the new rows before the second stage starts. Takes with nothing held, "
+                        "latent in for the first stage's upscaled copy of the held frames; the difference between the two copies, decoded, is "
+                        "the first stage's look, and it is taken out of the new rows before the second stage starts. Takes with nothing held, "
                         "and single-stage runs, pass through.",
             inputs=[
                 io.Latent.Input("latent", tooltip="From the second stage's H3 MCtx Apply Pins."),
+                io.Vae.Input("vae", tooltip="H3 video VAE."),
                 io.Latent.Input("unpinned", optional=True, tooltip="The same latent before Apply Pins: H3 Stage Latent's output."),
                 io.Float.Input("strength", default=0.9, min=0.0, max=2.0, step=0.05,
                                tooltip="How much of the first stage's look to take out of the new rows. 0 passes the latent through, as "
@@ -498,8 +563,8 @@ class AEXDriftHandoffMatch(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, latent, strength, unpinned=None) -> io.NodeOutput:
-        return io.NodeOutput(handoff_match(latent, unpinned, strength))
+    def execute(cls, latent, vae, strength, unpinned=None) -> io.NodeOutput:
+        return io.NodeOutput(handoff_match(latent, unpinned, vae, strength))
 
 
 class AEXDriftSeamAnchor(io.ComfyNode):
@@ -510,22 +575,23 @@ class AEXDriftSeamAnchor(io.ComfyNode):
             display_name="AEX Drift Seam Anchor",
             category="aex-drift",
             description="Grades an extend's new rows back to the tone of its held rows after sampling: where the picture holds still, "
-                        "a gain and offset per channel of the low frequencies, fitted region by region, and a gain per channel of the "
-                        "detail, row by row and smoothed over time, take out the model's darker low mids and added contrast. Takes with "
-                        "nothing held, or with too little of the picture still (a moving camera, a lighting change), pass through.",
+                        "a gain and offset per colour channel of the decoded low frequencies, fitted region by region, and a gain per "
+                        "channel of the detail, row by row and smoothed over time, take out the model's darker low mids and added contrast. "
+                        "Takes with nothing held, or with too little of the picture still (a moving camera, a lighting change), pass through.",
             inputs=[
                 io.Latent.Input("latent", tooltip="From the last stage's sampler, with Apply Pins' noise mask."),
+                io.Vae.Input("vae", tooltip="H3 video VAE."),
                 io.Float.Input("strength", default=1.0, min=0.0, max=2.0, step=0.05,
                                tooltip="How much of the measured correction to apply. 0 passes the take through; above 1 overshoots."),
                 io.Float.Input("region", default=0.2, min=0.0, max=1.0, step=0.01,
                                tooltip="Width of the window each low-frequency grade is fitted over, as a share of the frame width (0.2 is "
-                                       "17 latent pixels at 1408 wide). Smaller follows a region that drifts on its own, such as a door, "
+                                       "17 blocks of 16 px at 1408 wide). Smaller follows a region that drifts on its own, such as a door, "
                                        "but fits fewer pixels; 0 fits one grade to the whole picture."),
                 io.Float.Input("detail", default=1.0, min=0.0, max=2.0, step=0.05,
                                tooltip="How much of the fine-contrast correction to apply. The model adds a few percent of texture "
                                        "contrast per extend; 0 leaves the detail as sampled."),
                 io.Float.Input("still_tolerance", default=6.0, min=1.0, max=64.0, step=0.5,
-                               tooltip="How far a pixel may change, in 8-bit codes of the preview, and still count as background the "
+                               tooltip="How far a 16 px block may change, in 8-bit codes of luma, and still count as background the "
                                        "grade is measured on; a drift of the whole picture by up to half of it doesn't count. Higher lets "
                                        "slow motion and steam into the fit."),
                 io.Float.Input("min_still", default=0.1, min=0.01, max=1.0, step=0.01,
@@ -536,8 +602,8 @@ class AEXDriftSeamAnchor(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, latent, strength, region, detail, still_tolerance, min_still) -> io.NodeOutput:
-        return io.NodeOutput(seam_anchor(latent, strength, region, detail, still_tolerance, min_still))
+    def execute(cls, latent, vae, strength, region, detail, still_tolerance, min_still) -> io.NodeOutput:
+        return io.NodeOutput(seam_anchor(latent, vae, strength, region, detail, still_tolerance, min_still))
 
 
 class AEXDriftTextureHold(io.ComfyNode):
