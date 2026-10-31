@@ -106,6 +106,40 @@ class DriftTest(unittest.TestCase):
             self.assertIs(drift.AEXDriftFirstStagePins.execute(latent=stage, pins=pins, pin_specs=pin_specs, vae=vae).args[0], stage)
 
     def test_the_handoff_match_grades_the_new_rows_into_the_held_ones(self):
+        exact, audio = fake_latent(192, 0, width=192, height=128)["samples"].unbind()
+        gain, shift = torch.linspace(0.8, 1.25, 24).view(1, -1, 1, 1, 1), torch.linspace(-0.3, 0.3, 24).view(1, -1, 1, 1, 1)
+        upscaled = (exact - shift) / gain  # the first stage's look over every row
+        pinned = upscaled.clone()
+        pinned[:, :, :12] = exact[:, :, :12]
+        held = torch.ones(1, 1, 57, 8, 12)
+        held[:, :, :11] = 0.0
+        held[:, :, 11] = 0.5  # a feathered edge is still a row Apply Pins wrote
+        mask = NestedTensor((held, torch.ones(1, 1, 2, 320)))
+        stage = {"samples": NestedTensor((pinned, audio)), "noise_mask": mask}
+        out = drift.AEXDriftHandoffMatch.execute(latent=stage, strength=1.0, unpinned={"samples": NestedTensor((upscaled, audio))}).args[0]
+        video, out_audio = out["samples"].unbind()
+        blur = lambda x: torch.nn.functional.avg_pool3d(x, (1, 5, 5), stride=1, padding=(0, 2, 2), count_include_pad=False)
+        self.assertTrue(torch.equal(video[:, :, :12], exact[:, :, :12]))
+        new = upscaled[:, :, 12:]
+        # the low frequencies take the held look; the detail is left alone
+        self.assertTrue(torch.allclose(video[:, :, 12:], blur(exact[:, :, 12:]) + new - blur(new), atol=1e-4))
+        self.assertTrue(out_audio is audio and out["noise_mask"] is mask)
+        half = drift.AEXDriftHandoffMatch.execute(latent=stage, strength=0.5, unpinned={"samples": NestedTensor((upscaled, audio))}).args[0]
+        self.assertTrue(torch.allclose(half["samples"].unbind()[0], (pinned + video) / 2, atol=1e-5))
+        # a blank held window has no contrast to measure: only the offset moves
+        blank, dim = pinned.clone(), upscaled.clone()
+        blank[:, :, :12], dim[:, :, :12] = 0.5, 0.4
+        flat = drift.AEXDriftHandoffMatch.execute(latent=dict(stage, samples=NestedTensor((blank, audio))), strength=1.0,
+                                                   unpinned={"samples": NestedTensor((dim, audio))}).args[0]["samples"].unbind()[0]
+        self.assertTrue(torch.equal(flat[:, :, :12], blank[:, :, :12]) and torch.allclose(flat[:, :, 12:], blank[:, :, 12:] + 0.1, atol=1e-5))
+        # a single-stage run, a latent with nothing held and one with no mask pass through
+        nothing = dict(stage, noise_mask=NestedTensor((torch.ones(1, 1, 57, 8, 12), torch.ones(1, 1, 2, 320))))
+        for latent, unpinned in ((stage, None), (nothing, stage), ({"samples": stage["samples"]}, stage)):
+            self.assertIs(drift.AEXDriftHandoffMatch.execute(latent=latent, strength=1.0, unpinned=unpinned).args[0], latent)
+        with self.assertRaises(ValueError):  # decode needs the VAE
+            drift.AEXDriftHandoffMatch.execute(latent=stage, strength=1.0, decode=True, unpinned={"samples": NestedTensor((upscaled, audio))})
+
+    def test_the_decoded_handoff_match_grades_only_what_the_vae_draws(self):
         _, audio = fake_latent(192, 0, width=192, height=128)["samples"].unbind()
         torch.manual_seed(0)
         scene = 0.5 + 0.15 * torch.nn.functional.interpolate(torch.randn(1, 24, 3, 4), size=(8, 12), mode="bilinear").unsqueeze(2).expand(1, 24, 57, 8, 12)
@@ -122,7 +156,7 @@ class DriftTest(unittest.TestCase):
         mask = NestedTensor((held, torch.ones(1, 1, 2, 320)))
         stage = {"samples": NestedTensor((pinned, audio)), "noise_mask": mask}
         vae = RowVAE()
-        match = lambda latent, unpinned, strength=1.0, vae=vae: drift.AEXDriftHandoffMatch.execute(latent=latent, vae=vae, strength=strength, unpinned=unpinned).args[0]
+        match = lambda latent, unpinned, strength=1.0, vae=vae: drift.AEXDriftHandoffMatch.execute(latent=latent, vae=vae, strength=strength, decode=True, unpinned=unpinned).args[0]
         unpinned = {"samples": NestedTensor((upscaled, audio))}
         out = match(stage, unpinned)
         video, out_audio = out["samples"].unbind()
@@ -150,6 +184,82 @@ class DriftTest(unittest.TestCase):
     def test_the_seam_anchor_grades_the_new_rows_back_to_the_held_ones(self):
         _, audio = fake_latent(192, 0, width=384, height=256)["samples"].unbind()
         torch.manual_seed(0)
+        scene = torch.nn.functional.interpolate(torch.randn(1, 24, 4, 6), size=(16, 24), mode="bilinear").unsqueeze(2)
+        # a still picture whose rows differ by their place in each group of 5, so only a same-place held row matches a new one
+        truth = scene * torch.tensor([1.0, 0.7, 0.85, 1.15, 1.3]).repeat(12)[:57].view(1, 1, 57, 1, 1)
+        gain, shift = torch.linspace(0.97, 1.03, 24).view(1, -1, 1, 1, 1), torch.linspace(-0.01, 0.01, 24).view(1, -1, 1, 1, 1)
+        drifted = truth.clone()
+        drifted[:, :, 12:] = gain * truth[:, :, 12:] + shift
+        held = torch.ones(1, 1, 57, 16, 24)
+        held[:, :, :12] = 0.0
+        mask = NestedTensor((held, torch.ones(1, 1, 2, 320)))
+        take = {"samples": NestedTensor((drifted, audio)), "noise_mask": mask}
+        # region 0.7 fits 17-pixel windows across this 24-wide picture, as the default 0.2 does across 1408 wide
+        knobs = dict(strength=1.0, region=0.7, detail=1.0, still_tolerance=6.0, min_still=0.1)
+        anchor = lambda latent, **kw: drift.AEXDriftSeamAnchor.execute(latent=latent, **dict(knobs, **kw)).args[0]
+        out = anchor(take)
+        video, out_audio = out["samples"].unbind()
+        self.assertEqual({k: out["aex_drift_anchor"][k] for k in knobs}, knobs)
+        self.assertTrue(out["aex_drift_anchor"]["graded"] and out["aex_drift_anchor"]["share"] == 1.0)
+        self.assertTrue(torch.equal(video[:, :, :12], truth[:, :, :12]))
+        # the low frequencies and the detail are the held look again
+        self.assertTrue(torch.allclose(video[:, :, 12:], truth[:, :, 12:], atol=1e-4))
+        self.assertTrue(out_audio is audio and out["noise_mask"] is mask)
+        # half the strength goes half the way; without the detail grade the sampler's detail stays
+        blur = lambda x: torch.nn.functional.avg_pool3d(x, (1, 5, 5), stride=1, padding=(0, 2, 2), count_include_pad=False)
+        self.assertTrue(torch.allclose(anchor(take, strength=0.5)["samples"].unbind()[0], (drifted + video) / 2, atol=1e-4))
+        new = truth[:, :, 12:]
+        self.assertTrue(torch.allclose(anchor(take, detail=0.0)["samples"].unbind()[0][:, :, 12:], blur(new) + gain * (new - blur(new)), atol=1e-4))
+        # a region that darkens on its own gets its own grade, and the far side of the picture keeps its tone; one grade for the
+        # whole picture leaves both sides about the full 0.02 off
+        darker = truth.clone()
+        darker[:, :, 12:, :, :12] -= 0.02
+        darker = dict(take, samples=NestedTensor((darker, audio)))
+        graded = anchor(darker)
+        video = graded["samples"].unbind()[0]
+        # the record says which way the grade moved the preview luma, for the check to weigh what is left against
+        luma = torch.tensor(drift.MiniMaxH3Video.latent_rgb_factors) @ torch.tensor([0.2126, 0.7152, 0.0722])
+        moved = torch.einsum("bcthw,c->bthw", video[:, :, 12:] - darker["samples"].unbind()[0][:, :, 12:], luma).mean().item() * 127.5
+        self.assertAlmostEqual(graded["aex_drift_anchor"]["tone"], moved, delta=0.05 * abs(moved))
+        self.assertLess((video[..., :2] - truth[..., :2]).abs().max(), 0.005)
+        self.assertLess((video[..., 20:] - truth[..., 20:]).abs().max(), 0.005)
+        whole = anchor(darker, region=0.0)["samples"].unbind()[0]
+        self.assertGreater((whole[..., :2] - truth[..., :2]).abs().max(), 0.01)
+        # no mask and a root pass through; a head of fewer than 5 held rows and a picture that does not hold still pass through
+        # with a record of why
+        for latent in ({"samples": take["samples"]}, dict(take, noise_mask=NestedTensor((torch.ones(1, 1, 57, 16, 24), torch.ones(1, 1, 2, 320))))):
+            self.assertIs(anchor(latent), latent)
+        short = held.clone()
+        short[:, :, 4:] = 1.0
+        moved = drifted.clone()
+        moved[:, 9, 12:] += 1.0  # a lighting change
+        for latent, share in ((dict(take, noise_mask=NestedTensor((short, torch.ones(1, 1, 2, 320)))), None), (dict(take, samples=NestedTensor((moved, audio))), 0.0)):
+            out = anchor(latent)
+            self.assertTrue(out["samples"] is latent["samples"] and not out["aex_drift_anchor"]["graded"] and out["aex_drift_anchor"]["share"] == share)
+        # a dimming of the whole picture by about 7 codes is drift once half the tolerance of it is taken out, and is graded away;
+        # one of about 11 codes counts as still only under a wider tolerance
+        dim = lambda codes: dict(take, samples=NestedTensor((drifted + torch.eye(24)[9].view(1, -1, 1, 1, 1) * (torch.arange(57) >= 12).view(1, 1, -1, 1, 1)
+                                                             * codes / (luma[9].item() * 127.5), audio)))
+        self.assertTrue(torch.allclose(anchor(dim(7))["samples"].unbind()[0], truth, atol=1e-4))
+        dimmer = dim(11)
+        self.assertIs(anchor(dimmer)["samples"], dimmer["samples"])
+        graded = anchor(dimmer, still_tolerance=10.0)
+        self.assertTrue(graded["aex_drift_anchor"]["graded"] and torch.allclose(graded["samples"].unbind()[0], truth, atol=1e-4))
+        # where too little holds still, as on a moving subject, the grade fades out instead of borrowing the background's
+        torch.manual_seed(1)
+        busy = drifted.clone()
+        busy[:, :, 12:, :, :12] += torch.randn(1, 24, 45, 16, 12) * 0.5
+        busy = dict(take, samples=NestedTensor((busy, audio)))
+        graded = anchor(busy, detail=0.0)
+        video, before = graded["samples"].unbind()[0], busy["samples"].unbind()[0]
+        self.assertTrue(0.4 < graded["aex_drift_anchor"]["share"] < 0.6 and torch.equal(video[..., :2], before[..., :2]))
+        self.assertLess((video[..., 20:] - truth[..., 20:]).abs().mean(), (before[..., 20:] - truth[..., 20:]).abs().mean() / 3)
+        with self.assertRaises(ValueError):  # decode needs the VAE
+            anchor(take, decode=True)
+
+    def test_the_decoded_seam_anchor_grades_each_latent_row_alike(self):
+        _, audio = fake_latent(192, 0, width=384, height=256)["samples"].unbind()
+        torch.manual_seed(0)
         scene = 0.5 + 0.1 * torch.nn.functional.interpolate(torch.randn(1, 24, 4, 6), size=(16, 24), mode="bilinear").unsqueeze(2)
         # a still picture whose rows differ by their place in each group of 5, so only a same-place held row matches a new one
         truth = scene * torch.tensor([1.0, 0.9, 0.95, 1.05, 1.1]).repeat(12)[:57].view(1, 1, 57, 1, 1)
@@ -165,7 +275,7 @@ class DriftTest(unittest.TestCase):
         take = {"samples": NestedTensor((drifted, audio)), "noise_mask": mask}
         knobs = dict(strength=1.0, region=0.7, detail=1.0, still_tolerance=6.0, min_still=0.1)
         vae = RowVAE()
-        anchor = lambda latent, **kw: drift.AEXDriftSeamAnchor.execute(latent=latent, vae=vae, **dict(knobs, **kw)).args[0]
+        anchor = lambda latent, **kw: drift.AEXDriftSeamAnchor.execute(latent=latent, vae=vae, decode=True, **dict(knobs, **kw)).args[0]
         out = anchor(take)
         video, out_audio = out["samples"].unbind()
         self.assertEqual({k: out["aex_drift_anchor"][k] for k in knobs}, knobs)
