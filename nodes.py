@@ -84,8 +84,8 @@ def handoff_match(latent, unpinned, vae, strength):
     held one that it does not quite match. Both copies of the held rows show the same picture, so decoded they measure that look: a
     gain and offset per colour channel of the 80 px low frequencies, applied to the decoded new rows and encoded back into them.
     Fitted in the latent instead, the offset also took in what the soft copy lacks (the exact rows' detail lives in the means of
-    some channels), and added to the new rows it told the second stage there was detail there: at its first steps, where the noise
-    nearly hides the picture, it read that as light and blew out a forehead or a cheek."""
+    some channels), and added to every new row it pushed the second stage's first steps, where the noise nearly hides the
+    picture, far enough to blow out a patch where the model was unsure, such as a forehead under a raised hand."""
     mask = latent.get("noise_mask")
     if unpinned is None or mask is None:
         return latent

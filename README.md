@@ -4,7 +4,7 @@ ComfyUI nodes that hold a MiniMax H3 extend to the tone and texture of the clip 
 
 An extend's new frames drift from the frames it holds: shadows darken and spread, mids drop a code or two, contrast grows, and textures roughen (blotchier skin, harder folds). The next extend continues from the drifted latent, so the drift adds up over a chain.
 
-The held frames are the earlier clip's own latent, so they show what the new frames should look like. Where the picture holds still, Seam Anchor fits the new frames back to them in the latent. It fits a per-channel gain and offset of the low frequencies window by window, and a per-channel gain of the detail, then smooths both over time. Handoff Match does the same at a two-stage run's handover, and First Stage Pins keeps the MP4 out of the first stage's starting point. Texture Hold softens the new frames' texture back to the held frames' level, moving subjects included. All of it happens before the decode and the save, so the next extend continues from the corrected latent. AEX Drift Check then measures what is left.
+The held frames are the earlier clip's own latent, so they show what the new frames should look like. Where the picture holds still, Seam Anchor fits the decoded new frames back to them. It fits a gain and offset of luma and chroma in the low frequencies window by window, and a gain of the detail, one correction per latent row, then smooths both over time and encodes the change back into the latent. Handoff Match measures the first stage's look the same way at a two-stage run's handover, and First Stage Pins keeps the MP4 out of the first stage's starting point. Texture Hold softens the new frames' texture back to the held frames' level, moving subjects included. All of it happens before the decode and the save, so the next extend continues from the corrected latent. AEX Drift Check then measures what is left.
 
 Caveats:
 
@@ -12,7 +12,8 @@ Caveats:
 - It measures only the parts of the picture that hold still. A moving camera or a large lighting change makes the take pass through. Moving subjects keep their own tone: the grade fades out where little holds still, so the background's grade can't tint them, but it doesn't correct their drift either.
 - A deliberate tone change of the whole picture under about 1.5 × `still_tolerance`, such as a slow fade, is treated as drift and pulled back.
 - It corrects tone and texture contrast, not geometry or content, and it slows the drift rather than stopping it.
-- Texture Hold only softens, never sharpens, and never below the held frames' level per material and window. A window whose texture jumped far past an extend's roughening (a hand moving onto a face, a turn of the head) counts as new content and is left alone. It decodes the take and re-encodes the clips with new frames, about 3.5 minutes for a 243-frame take at 1600×1184 on an RTX 5090.
+- Texture Hold only softens, never sharpens, and never below the held frames' level per material and window. A window whose texture jumped far past an extend's roughening (a hand moving onto a face, a turn of the head) counts as new content and is left alone.
+- Handoff Match, Seam Anchor and Texture Hold each decode the take and re-encode the clips with new frames: about 2.7, 2.5 and 3 minutes for a 243-frame take at 1600×1184 on an RTX 5090.
 - It was tested on the obvpm Timeline workflow. Single-stage runs, and Handoff Match outside obvpm, are untested.
 
 ## Requirements
@@ -30,15 +31,15 @@ Clone this repository into `ComfyUI/custom_nodes/` and restart ComfyUI. The node
 | Node | What it intended to solve | Wiring | What it does |
 |---|---|---|---|
 | AEX Drift First Stage Pins | In a two-stage extend, obvpm pins the small first stage from the parent's MP4: 8-bit, read back about a code darker with more pixels clipped to black, and carrying any grade the save applied. The first stage then starts from a darker, re-graded copy of frames the second stage holds exactly. | Between the first stage's Apply Pins and its sampler. `pin_specs` from the Timeline, `vae` the H3 video VAE. | Re-encodes the first stage's pin from the clip's saved latent instead of its MP4. |
-| AEX Drift Handoff Match | The step at the join of a two-stage extend. The second stage's Apply Pins swaps the parent's exact latent into the held rows, but the new rows keep the first stage's look, made small and upscaled. The second stage then grows new frames next to held ones they don't match, with darker shadows and more contrast from the join on. | Between the second stage's Apply Pins and its sampler. `unpinned` is the same latent before Apply Pins. | Takes the first stage's look out of the new rows before the second stage samples them. In tests it also held the geometry: without it the background came out 1–2 px squished vertically. |
-| AEX Drift Seam Anchor | H3's own drift as it samples an extend: over the first few dozen new frames the low mids darken a code or two, shadows spread, and contrast and texture contrast grow. The next extend continues from the drifted latent, so the drift adds up over a chain. | After the last sampler, feeding both the decode and the saved latent. | Grades the new rows back to the held rows where the picture holds still, region by region. Moving subjects are left as sampled. |
+| AEX Drift Handoff Match | The step at the join of a two-stage extend. The second stage's Apply Pins swaps the parent's exact latent into the held rows, but the new rows keep the first stage's look, made small and upscaled. The second stage then grows new frames next to held ones they don't match, with darker shadows and more contrast from the join on. | Between the second stage's Apply Pins and its sampler. `unpinned` is the same latent before Apply Pins, `vae` the H3 video VAE. | Decodes both copies of the held frames, measures the first stage's look between them (a gain and offset per colour channel of the low frequencies) and takes it out of the new rows before the second stage samples them. In one scene it also held the geometry: without it the background came out 1–2 px squished vertically. |
+| AEX Drift Seam Anchor | H3's own drift as it samples an extend: over the first few dozen new frames the low mids darken a code or two, shadows spread, and contrast and texture contrast grow. The next extend continues from the drifted latent, so the drift adds up over a chain. | After the last sampler, feeding both the decode and the saved latent. `vae` the H3 video VAE. | Grades the decoded new rows back to the held rows where the picture holds still, region by region, with one correction for all the frames of a latent row, and encodes the change back. Moving subjects are left as sampled. |
 | AEX Drift Texture Hold | Each extend comes out a little rougher than the frames it holds, mostly at 3–20 px: blotchier skin, harder folds, more pronounced lines. Seam Anchor holds texture only where the picture is still, so faces and clothes keep roughening, extend after extend. Resampling the last steps, with the base model or a turbo LoRA, didn't soften it in tests. | After Seam Anchor, feeding both the decode and the saved latent. `vae` the H3 video VAE. | Splits the decoded frames into bands and the picture into colour materials, and measures each material on its own interior, window by window. Where a material came out rougher than in the held frames, it scales the 3–8 px and 8–20 px bands back to the held level, never further than the material's energy over the whole picture rose. The 1–3 px band (pores, grain) is left as sampled. The change goes back into the latent. |
 | AEX Drift Check | Drift of a code or two is hard to judge by eye, and the 8-bit files can't show less than a code. Testers on different setups need numbers for each take and a hint of which knob to try next. | `images` from VAE Decode, untrimmed; `latent` from Seam Anchor. | Shows on the node how far the new frames moved off the held ones, and suggests a knob to try. |
 
 Notes:
 
 - Handoff Match compares two clean latents. If your graph adds the stage-2 noise in a separate pass before the pins are written, move the noise into the final sampler first.
-- Seam Anchor and Texture Hold need at least 5 held latent steps. The nodes were tested with 39-frame holds (12 steps).
+- Seam Anchor needs at least 7 held latent steps and Texture Hold 5. The nodes were tested with 39-frame holds (12 steps).
 - Roots, single-stage runs (for First Stage Pins and Handoff Match), and takes with too little still picture pass through.
 
 ## Check
@@ -67,7 +68,7 @@ The `check` switch turns it off. The report also goes to the console log. With `
   - `strength` (1.0): 0 passes through; above 1 overshoots.
   - `region` (0.2): the width of each fitting window, as a share of the frame width. 0 fits one grade to the whole picture.
   - `detail` (1.0): how much of the fine-contrast correction to apply.
-  - `still_tolerance` (6): how far a pixel may change, in 8-bit preview codes, and still count as still. A drift of the whole picture by up to half of it doesn't count as change.
+  - `still_tolerance` (6): how far a 16 px block may change, in 8-bit codes of luma, and still count as still. A drift of the whole picture by up to half of it doesn't count as change.
   - `min_still` (0.1): below this share of still picture, the take passes through.
 - Texture Hold:
   - `strength` (1.0): how much of the measured softening to apply. 0 passes through.
@@ -103,9 +104,12 @@ Over those two extends the face gained +1% / −3% with the hold against about +
 
 ## Known issues
 
-**Neon patches with Handoff Match.** In two two-stage extends, each rendered twice from the same parent and seed, the take with Handoff Match on developed neon patches and the take with it bypassed didn't. The patches showed on a moving subject: blown-out, oversaturated color with crushed black beside it, fixed in screen position while the subject moved. They form during the second stage's sampling and already show in its preview, before the decode. Seam Anchor doesn't cause them and AEX Drift Check doesn't detect them.
+**Neon and blown-out patches on faces.** A two-stage extend can come out with a flat neon, orange or white patch on a face, often a forehead under a raised hand, fixed in place while the subject moves. It forms in the second stage's first two steps.
 
-So far they have been seen only at Handoff Match `strength` 1.0, not yet at 0.9, the default. If a take shows them, render it again with another seed, or lower `strength` or bypass the node. Without Handoff Match the background came out 1–2 px squished vertically in one scene, though not in another.
+- Before this version, Handoff Match's latent offset caused many of them: on one extend at three seeds, the old node patched all three, this version none at two of them.
+- The rest start in the first stage: where its draft clips a highlight to white on something the held frames don't show, the second stage fills the flat area with an invented shape. That happens with Handoff Match bypassed too. If a take shows one, render it again with another seed.
+
+**Flicker in still areas (fixed).** Before this version, Seam Anchor graded the latent channel by channel and window by window. The decoder draws some latent channels as change between the 4 frames of a latent row, so still areas flickered a code dark on every row's third frame, at about 6 Hz. Seam Anchor now grades the decoded frames with one correction per latent row.
 
 ## Tests
 
