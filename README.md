@@ -94,10 +94,20 @@ Typical results from our tests:
 - **Texture Hold:** the per-extend rise in face texture (+7% to +14% at 3–20 px) dropped to 0–5%. Over two extends it came to about +1% with the hold, against about +19% without it. The 1–3 px band stayed within 3%, and scenes without roughening were left nearly as they were. It caused no tone change.
 - **`decode` on:** the flicker and the Handoff Match patches under Known issues went away, with the same tone hold.
 
+obvpm Timeline exports without the AEX nodes (top) and with them (bottom):
+
+![Five frames from 260 to 860 of an obvpm export without the AEX nodes above the same frames with them](examples/export_00004_vs_00003.jpg)
+
+The upper-left quadrant of the same exports:
+
+![Upper-left quadrant of frames 130 to 860 of the same two exports](examples/export_00004_vs_00003_ul.jpg)
+
 ## Known issues
 
 ### Patches on faces 
 A two-stage extend can come out with a flat neon, orange or white patch on a face, fixed in place while the subject moves. It forms in the second stage's first steps.
+
+![Two takes with a patch on the forehead: a flat yellow shape, and a blown-out white area](examples/known_issue_1.png)
 
 - Handoff Match's latent grade causes many of them: its offset also carries detail the soft upscaled copy lacks. In one test at three seeds, the latent grade patched all three takes; with `decode` on, only one did.
 - The rest come from the first stage: where it clips a highlight to white on something the held frames don't show, the second stage fills the flat area with an invented shape, with or without Handoff Match. Render again with another seed.
