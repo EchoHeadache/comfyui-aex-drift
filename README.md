@@ -12,7 +12,7 @@ The held frames are the earlier clip's own latent, so they show what the new fra
 - Texture Hold softens the new frames' texture back to the held level, moving subjects included.
 - Check measures what is left and suggests a knob to try.
 
-Handoff Match and Seam Anchor grade the latent by default. With `decode` on, they grade the decoded frames and encode the change back. That avoids the artifacts under Known issues, but takes a few minutes per take.
+Handoff Match and Seam Anchor grade the decoded frames by default and encode the change back, which takes a few minutes per take. With `decode` off, they grade the latent instead: faster, but with the artifacts under Known issues.
 
 ## Caveats
 
@@ -47,7 +47,7 @@ Clone this repository into `ComfyUI/custom_nodes/` and restart ComfyUI. The node
 Notes:
 
 - Handoff Match compares two clean latents. If your graph adds the stage-2 noise in a separate pass before the pins are written, move the noise into the final sampler first.
-- Seam Anchor needs at least 5 held latent steps (7 with `decode` on), Texture Hold 5. The nodes were tested with 39-frame holds (12 steps).
+- Seam Anchor needs at least 7 held latent steps (5 with `decode` off), Texture Hold 5. The nodes were tested with 39-frame holds (12 steps).
 - Roots, single-stage runs (for First Stage Pins and Handoff Match) and takes with too little still picture pass through.
 
 ## Check
@@ -72,15 +72,15 @@ A shift counts at 0.5 code for p10–p75, 1 point for the <=18 share, 0.5% contr
 ## Knobs
 
 - Handoff Match:
-  - `strength` (0.9): 0 passes the latent through.
-  - `decode` (off): grade decoded frames instead of the latent. Needs `vae`.
+  - `strength` (1.0): 0 passes the latent through.
+  - `decode` (on): grade decoded frames instead of the latent. Needs `vae`.
 - Seam Anchor:
   - `strength` (1.0): 0 passes through; above 1 overshoots.
   - `region` (0.2): the width of each fitting window, as a share of the frame width. 0 fits one grade to the whole picture.
   - `detail` (1.0): how much of the fine-contrast correction to apply.
   - `still_tolerance` (6): how far a 16 px block may change, in 8-bit luma codes, and still count as still. A drift of the whole picture by up to half of it doesn't count.
   - `min_still` (0.1): below this share of still picture, the take passes through.
-  - `decode` (off): grade decoded frames, one correction per latent row, instead of the latent. Needs `vae`.
+  - `decode` (on): grade decoded frames, one correction per latent row, instead of the latent. Needs `vae`.
 - Texture Hold:
   - `strength` (1.0): how much of the measured softening to apply. 0 passes through.
   - `window` (0.08): the width of the measuring windows, as a share of the frame width (128 px at 1600 wide).

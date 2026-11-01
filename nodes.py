@@ -652,10 +652,10 @@ class AEXDriftHandoffMatch(io.ComfyNode):
                 io.Latent.Input("latent", tooltip="From the second stage's H3 MCtx Apply Pins."),
                 io.Latent.Input("unpinned", optional=True, tooltip="The same latent before Apply Pins: H3 Stage Latent's output."),
                 io.Vae.Input("vae", optional=True, tooltip="H3 video VAE, for decode."),
-                io.Float.Input("strength", default=0.9, min=0.0, max=2.0, step=0.05,
+                io.Float.Input("strength", default=1.0, min=0.0, max=2.0, step=0.05,
                                tooltip="How much of the first stage's look to take out of the new rows. 0 passes the latent through, as "
                                        "bypassing does; in tests the background came out 1-2 px squished vertically without it."),
-                io.Boolean.Input("decode", default=False, label_on="on", label_off="off",
+                io.Boolean.Input("decode", default=True, label_on="on", label_off="off",
                                  tooltip="On measures and applies the look on decoded frames and encodes the change back (needs vae; about "
                                          "2.7 min for a 243-frame take at 1600x1184 on an RTX 5090). Off grades the latent channels: in tests "
                                          "its offset could blow out a patch on a face in the second stage, where decoding didn't."),
@@ -703,7 +703,7 @@ class AEXDriftSeamAnchor(io.ComfyNode):
                 io.Float.Input("min_still", default=0.1, min=0.01, max=1.0, step=0.01,
                                tooltip="Share of the picture that must hold still for the grade to run; below it (a moving camera, a "
                                        "lighting change) the take passes through."),
-                io.Boolean.Input("decode", default=False, label_on="on", label_off="off",
+                io.Boolean.Input("decode", default=True, label_on="on", label_off="off",
                                  tooltip="On grades the decoded frames, one correction for all the frames of a latent row, and encodes the change "
                                          "back (needs vae and 7 held latent steps; about 2.5 min for a 243-frame take at 1600x1184 on an RTX 5090). "
                                          "Off grades the latent channels: in tests that made still areas flicker a code dark on every latent "
