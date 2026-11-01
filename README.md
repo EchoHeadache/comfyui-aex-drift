@@ -44,6 +44,10 @@ Clone this repository into `ComfyUI/custom_nodes/` and restart ComfyUI. The node
 | AEX Drift Texture Hold | Each extend comes out a little rougher, mostly at 3–20 px: blotchier skin, harder folds, sharper lines. Seam Anchor holds texture only where the picture is still, and resampling the last steps didn't soften it in tests. | After Seam Anchor, feeding the decode and the saved latent. `vae` the H3 video VAE. | Splits the decoded frames into bands and the picture into colour materials, measures each material window by window, and scales the 3–8 px and 8–20 px bands back to the held level where they came out rougher. The 1–3 px band (pores, grain) is left alone. The change goes back into the latent. |
 | AEX Drift Check | Drift of a code or two is hard to see, and 8-bit files can't show less than a code. | `images` from VAE Decode, untrimmed; `latent` from Seam Anchor. | Shows on the node how far the new frames moved from the held ones, and suggests a knob to try. |
 
+The second stage of the obvpm Timeline with Handoff Match, Seam Anchor, Texture Hold and Check wired in (First Stage Pins sits in the first stage, not shown):
+
+![Handoff Match between Apply Pins and H3 Stage Sampling, then Seam Anchor and Texture Hold after the sampler, feeding the decode, the save and Check](examples/wire_example_obvpm_timeline.jpg)
+
 Notes:
 
 - Handoff Match compares two clean latents. If your graph adds the stage-2 noise in a separate pass before the pins are written, move the noise into the final sampler first.
