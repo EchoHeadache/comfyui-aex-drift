@@ -22,7 +22,7 @@ Handoff Match and Seam Anchor grade the decoded frames by default and encode the
 - It corrects tone and texture contrast, not geometry or content, and it slows the drift rather than stopping it.
 - Texture Hold only softens, never sharpens, and never below the held level. Texture that jumped far past normal roughening (a hand moving onto a face, a head turning) counts as new content and is left alone.
 - Texture Hold, and Handoff Match and Seam Anchor with `decode` on, decode the take and re-encode it: about 3, 2.7 and 2.5 minutes for a 243-frame take at 1600×1184 on an RTX 5090.
-- Tested on the obvpm Timeline workflow. Single-stage runs, and Handoff Match outside obvpm, are untested.
+- Tested on the obvpm Timeline workflow. Single-stage runs are only lightly tested (with success) using just Drift Seam Anchor and Texture Hold nodes. Using the nodes outside obvpm is untested, but in theory should work the same.
 
 ## Requirements
 
@@ -96,12 +96,24 @@ Typical results from our tests:
 
 ## Known issues
 
-**Patches on faces.** A two-stage extend can come out with a flat neon, orange or white patch on a face, fixed in place while the subject moves. It forms in the second stage's first steps.
+### Patches on faces 
+A two-stage extend can come out with a flat neon, orange or white patch on a face, fixed in place while the subject moves. It forms in the second stage's first steps.
 
 - Handoff Match's latent grade causes many of them: its offset also carries detail the soft upscaled copy lacks. In one test at three seeds, the latent grade patched all three takes; with `decode` on, only one did.
 - The rest come from the first stage: where it clips a highlight to white on something the held frames don't show, the second stage fills the flat area with an invented shape, with or without Handoff Match. Render again with another seed.
 
-**Flicker in still areas with Seam Anchor's latent grade.** The decoder draws some latent channels as change between the 4 frames of a latent row. A grade that varies window by window moves them, so still areas can flicker a code darker on every row's third frame (about 6 Hz). With `decode` on, the flicker was gone in tests and the tone hold was the same, but on some takes texture contrast came out up to 2% softer and highlights up to 1.5 codes darker.
+**Workarounds** 
+- Try a different seed
+- Use fewer steps on the low-res stage
+- Set Decode 'On' on the Drift Handoff Match
+- Don't use dual-stage
+
+### Flicker in still areas with Seam Anchor's latent grade.
+The decoder draws some latent channels as change between the 4 frames of a latent row. A grade that varies window by window moves them, so still areas can flicker a code darker on every row's third frame (about 6 Hz). With `decode` on, the flicker was gone in tests and the tone hold was the same, but on some takes texture contrast came out up to 2% softer and highlights up to 1.5 codes darker.
+- Set Decode 'On' on the Drift Seam Anchor
+
+### Color drift across extensions
+- H3 being H3.  Maintain references across generations.  I.e. keep a subject reference image across each segment even if they are in the pinned frames for the extension.
 
 ## Tests
 
